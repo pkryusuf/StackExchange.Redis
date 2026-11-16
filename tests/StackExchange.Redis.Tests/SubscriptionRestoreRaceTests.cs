@@ -47,6 +47,46 @@ public class SubscriptionRestoreRaceTests(ITestOutputHelper output)
             Assert.Equal(1, Volatile.Read(ref server.FirstSubscribeCount));
             Assert.Equal(0, Volatile.Read(ref server.SecondSubscribeCount));
             Assert.Same(firstServer, subscription.GetAnyCurrentServer());
+            Assert.Equal(1, await second); // deferred, but counted as a pending change, not "no change"
+        }
+        finally
+        {
+            server.Release.Set();
+            try { await first.WithTimeout(5000); } catch { }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UserSubscribeDoesNotDeferToInFlightRestore(bool pattern)
+    {
+        using var server = new PausedSubscribeServer(output);
+        await using var connection = await server.ConnectAsync();
+        var subscriber = connection.DefaultSubscriber;
+        var channel = pattern ? RedisChannel.Pattern("restoration.*") : RedisChannel.Literal("restoration.channel");
+        var subscription = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+        var firstServer = connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured);
+        var secondServer = connection.GetServerEndPoint(server.SecondEndPoint, ServerProvenance.Configured);
+        var first = subscription.EnsureSubscribedToServerAsync(subscriber, channel, CommandFlags.None, true, firstServer);
+        try
+        {
+            await server.FirstSubscribe.Task.WithTimeout(5000);
+
+            // a *user* subscribe (internalCall: false) must not silently defer to the in-flight
+            // restore, which this caller cannot observe failing: it subscribes for itself, and
+            // only returns once its own subscribe is acknowledged
+            var second = subscription.EnsureSubscribedToServerAsync(subscriber, channel, CommandFlags.None, false, secondServer);
+            await second.WithTimeout(5000);
+            Assert.Equal(1, Volatile.Read(ref server.SecondSubscribeCount));
+            await WaitForCurrentServerAsync(subscription);
+            Assert.Same(secondServer, subscription.GetAnyCurrentServer());
+
+            // when the paused restore's ack finally lands it is the stray, and is unsubscribed
+            server.Release.Set();
+            await first.WithTimeout(5000);
+            await server.FirstUnsubscribe.Task.WithTimeout(5000);
+            Assert.Same(secondServer, subscription.GetAnyCurrentServer());
         }
         finally
         {
@@ -99,6 +139,7 @@ public class SubscriptionRestoreRaceTests(ITestOutputHelper output)
         public readonly ManualResetEventSlim Release = new();
         public readonly TaskCompletionSource<bool> FirstSubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int FirstSubscribeCount, SecondSubscribeCount;
+        public readonly TaskCompletionSource<bool> FirstUnsubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public readonly TaskCompletionSource<bool> SecondUnsubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public PausedSubscribeServer(ITestOutputHelper output) : base(output) => SecondEndPoint = AddEmptyNode();
@@ -125,7 +166,14 @@ public class SubscriptionRestoreRaceTests(ITestOutputHelper output)
                 && request.GetString(1).StartsWith("restoration.", StringComparison.Ordinal))
             {
                 TryGetNode(DefaultEndPoint, out var firstNode);
-                if (!ReferenceEquals(client.Node, firstNode)) SecondUnsubscribe.TrySetResult(true);
+                if (ReferenceEquals(client.Node, firstNode))
+                {
+                    FirstUnsubscribe.TrySetResult(true);
+                }
+                else
+                {
+                    SecondUnsubscribe.TrySetResult(true);
+                }
             }
             return result;
         }
