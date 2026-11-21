@@ -944,8 +944,8 @@ public class RedisValueEquivalencyUnitTests
     public void BinaryComparer_DoesNotDependOnHowAValueIsStored()
     {
         // Binary reads the UTF8 form of both sides, so the same text compares equal to itself however it
-        // arrived. The default rules do not manage this for every input - see #3233, where a string and the
-        // bytes of that same string can simplify differently - so this is a property worth holding onto.
+        // arrived. The default rules hold this too since #3233 (see SameTextIsEqualRegardlessOfStorage), but
+        // it is a property worth holding onto for the comparer independently.
         var binary = RedisValue.EqualityComparer.Binary;
         foreach (var text in new[] { "1,000", "(5)", " 5 ", "1,0,0,0", "1e2", "42", "hello", "" })
         {
@@ -955,6 +955,58 @@ public class RedisValueEquivalencyUnitTests
             Assert.True(binary.Equals(asString, asBlob), $"'{text}' across storage");
             Assert.Equal(binary.GetHashCode(asString), binary.GetHashCode(asBlob));
         }
+    }
+
+    [Fact]
+    public void SameTextIsEqualRegardlessOfStorage()
+    {
+        // #3233: a string and the UTF8 bytes of that same string must simplify identically, otherwise a value
+        // is not equal to itself after a round trip (written as a string, read back as a blob)
+        foreach (var text in new[]
+        {
+            "1,000", "(5)", " 5 ", "5 ", " 5", "1,0,0,0", "$5", "5%", "	5", "0x10", "1_000",
+            "5.", "+5", "-5", "1e2", "1E+2", ".5", "-0.0", "42", "123.000", "18446744073709551615",
+            "inf", "-inf", "nan", "hello", "",
+        })
+        {
+            RedisValue asString = text;
+            RedisValue asBlob = Encoding.UTF8.GetBytes(text);
+            RedisValue asSequence = text.Length > 1 ? Segmented(Encoding.UTF8.GetBytes(text), 1) : asBlob;
+
+            Assert.True(asString == asBlob, $"'{text}': string == blob");
+            Assert.True(asString == asSequence, $"'{text}': string == sequence");
+            Assert.Equal(asString.GetHashCode(), asBlob.GetHashCode());
+            Assert.Equal(asString.GetHashCode(), asSequence.GetHashCode());
+        }
+    }
+
+    [Theory]
+    [InlineData("1,000", "1000")]
+    [InlineData("(5)", "-5")]
+    [InlineData(" 5 ", "5")]
+    [InlineData("1,0,0,0", "1000")]
+    public void LooselyFormattedTextIsNotNumeric(string text, string number)
+    {
+        // #3233: thousands separators, parentheses and surrounding whitespace do not make text numeric
+        RedisValue value = text;
+        Assert.False(value == (RedisValue)number);
+        Assert.False(value == (RedisValue)Encoding.UTF8.GetBytes(number));
+        Assert.False(value == long.Parse(number));
+        Assert.Equal(text, (string?)value);
+    }
+
+    [Theory]
+    [InlineData("5.", 5)]
+    [InlineData("+5", 5)]
+    [InlineData("1e2", 100)]
+    [InlineData("100.000", 100)]
+    [InlineData("-7", -7)]
+    public void StrictNumericTextIsStillNumeric(string text, long number)
+    {
+        RedisValue value = text;
+        Assert.True(value == number);
+        Assert.True(value == (RedisValue)Encoding.UTF8.GetBytes(text));
+        Assert.Equal(((RedisValue)number).GetHashCode(), value.GetHashCode());
     }
 
     [Fact]

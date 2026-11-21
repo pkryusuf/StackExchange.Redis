@@ -1577,21 +1577,30 @@ namespace StackExchange.Redis
         internal RedisValue Simplify()
         {
             long i64;
-            ulong u64;
+            double f64;
+            RedisValue simplified;
             switch (Type)
             {
                 case StorageType.String:
+                    // numeric forms are short and ASCII, so copy plausibly-numeric strings into a small
+                    // stack buffer and reuse the byte-based parsing; this keeps "numeric" strict (no
+                    // thousands separators, parentheses, whitespace, etc) and means a string simplifies
+                    // identically to the same text stored as bytes
                     string s = RawString();
-                    if (Format.CouldBeInteger(s))
+                    if (s.Length <= Format.MaxDoubleTextLen)
                     {
-                        if (Format.TryParseInt64(s, out i64)) return i64;
-                        if (Format.TryParseUInt64(s, out u64)) return u64;
+                        Span<byte> tmp = stackalloc byte[Format.MaxDoubleTextLen];
+                        int len = 0;
+                        while (len < s.Length && s[len] < 128)
+                        {
+                            tmp[len] = (byte)s[len];
+                            len++;
+                        }
+                        if (len == s.Length && TrySimplify(tmp.Slice(0, len), out simplified)) return simplified;
                     }
-                    // note: don't simplify inf/nan, as that causes equality semantic problems
-                    if (Format.TryParseDouble(s, out var f64) && !IsSpecialDouble(f64)) return f64;
                     break;
                 case StorageType.MemoryManager or StorageType.ByteArray or StorageType.ShortBlob:
-                    if (TrySimplify(UnsafeRawSpan(out _), out var simplified)) return simplified;
+                    if (TrySimplify(UnsafeRawSpan(out _), out simplified)) return simplified;
                     break;
                 case StorageType.Sequence:
                     // numeric forms are short, so we only need to consider plausibly-numeric lengths;
